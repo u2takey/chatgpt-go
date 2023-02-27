@@ -1,4 +1,4 @@
-module github.com/u2takey/chatgpt-go/cmd
+module github.com/u2takey/chatgpt-go/chat-service
 
 go 1.18
 

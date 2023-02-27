@@ -8,6 +8,8 @@ Refer to [test](./chatgpt_test.go) for usage.
 
 ## chatgpt-service 
 
+serve chatgpt-api as http service
+
 ```sh
 >> make docker 
 >> docker run -p 8088:8088 chat-service
