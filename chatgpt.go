@@ -83,6 +83,9 @@ func NewChatbot(config *Config) (*Chatbot, error) {
 		return nil, err
 	}
 	cachedConfig := c.loadCache()
+	if cachedConfig.ConversationMapping == nil {
+		cachedConfig.ConversationMapping = map[string]interface{}{}
+	}
 	if config != nil {
 		// update config with new
 		if config.Email != "" {
