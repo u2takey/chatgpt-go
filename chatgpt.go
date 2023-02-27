@@ -20,17 +20,19 @@ var (
 	BASEURL = getEnvWithDefault("CHATGPT_BASE_URL", "https://chatgpt.duti.tech/")
 )
 
-// GptError
-//-1: User error
-// 0: Unknown error
-// 1: Server error
-// 2: Rate limit error
-// 3: Invalid request error
-// 4: Expired access token error
-// 5: Invalid access token error
-// 6: Insufficient login details
+type ErrorCode int
+
+const (
+	UnknownError   ErrorCode = 500
+	ServerError    ErrorCode = 501
+	RateLimitError ErrorCode = 429
+	UserNotValid   ErrorCode = 401
+	TokenInvalid   ErrorCode = 403
+	RequestInvalid ErrorCode = 400
+)
+
 type GptError struct {
-	Code    int
+	Code    ErrorCode
 	Message string
 }
 
@@ -38,7 +40,12 @@ func (e *GptError) Error() string {
 	return fmt.Sprintf("gpt error: code=%d, message=%s", e.Code, e.Message)
 }
 
+func NewGptError(code ErrorCode, message string) *GptError {
+	return &GptError{Code: code, Message: message}
+}
+
 type Config struct {
+	// config
 	Email        string
 	Password     string
 	SessionToken string
@@ -47,6 +54,11 @@ type Config struct {
 	UserId       string
 	LayLoading   bool
 	Paid         bool
+	// history
+	ConversationId      string
+	ParentId            string
+	ConversationQueue   []conversationInQueue
+	ConversationMapping map[string]interface{}
 }
 
 type conversationInQueue struct {
@@ -55,30 +67,47 @@ type conversationInQueue struct {
 }
 
 type Chatbot struct {
-	config              *Config
-	conversationId      string
-	parentId            string
-	conversationQueue   []conversationInQueue
-	conversationMapping map[string]interface{}
-	configDir           string
-	session             *gorequests.Session
-	cachePath           string
-	sessionPath         string
+	*Config
+	session     *gorequests.Session
+	cachePath   string
+	sessionPath string
+	configDir   string
 }
 
 func NewChatbot(config *Config) (*Chatbot, error) {
 	if config.UserId == "" {
-		return nil, &GptError{Code: -1, Message: "user id cannot be empty"}
+		return nil, NewGptError(RequestInvalid, "user id cannot be empty")
 	}
-	c := &Chatbot{config: config, conversationMapping: map[string]interface{}{}}
+	c := &Chatbot{Config: config}
 	if err := c.makeHomePath(config); err != nil {
 		return nil, err
 	}
-
-	cachedToken, err := c.getCachedAccessToken()
-	if err == nil && cachedToken != "" && c.config.AccessToken == "" {
-		c.config.AccessToken = cachedToken
+	cachedConfig := c.loadCache()
+	if config != nil {
+		// update config with new
+		if config.Email != "" {
+			cachedConfig.Email = config.Email
+		}
+		if config.Password != "" {
+			cachedConfig.Password = config.Password
+		}
+		if config.SessionToken != "" {
+			cachedConfig.SessionToken = config.SessionToken
+		}
+		if config.AccessToken != "" {
+			cachedConfig.AccessToken = config.AccessToken
+		}
+		if config.HomePath != "" {
+			cachedConfig.HomePath = config.HomePath
+		}
+		if config.LayLoading != cachedConfig.LayLoading {
+			cachedConfig.LayLoading = config.LayLoading
+		}
+		if config.Paid != cachedConfig.Paid {
+			cachedConfig.Paid = config.Paid
+		}
 	}
+	c.Config = cachedConfig
 	return c, c.checkCredentials()
 }
 
@@ -91,7 +120,7 @@ func (c *Chatbot) makeHomePath(config *Config) error {
 	if config.HomePath == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return err
+			return NewGptError(ServerError, err.Error())
 		}
 		config.HomePath = home
 	}
@@ -100,10 +129,11 @@ func (c *Chatbot) makeHomePath(config *Config) error {
 	}
 	c.configDir = config.HomePath + "/.config/" + config.UserId
 	if err := os.MkdirAll(c.configDir, 0o777); err != nil {
-		return err
+		return NewGptError(ServerError, err.Error())
 	}
 	c.cachePath = c.configDir + "/.chatgpt_cache.json"
 	if _, err := os.Stat(c.cachePath); os.IsNotExist(err) {
+		// init config
 		_ = ioutil.WriteFile(c.cachePath, []byte("{}"), 0o666)
 	}
 	c.sessionPath = c.configDir + "/.chatgpt_session"
@@ -111,20 +141,21 @@ func (c *Chatbot) makeHomePath(config *Config) error {
 }
 
 func (c *Chatbot) checkCredentials() error {
-	if c.config.AccessToken != "" {
-		_ = c.refreshHeaders(c.config.AccessToken)
-	} else if c.config.SessionToken != "" {
-	} else if c.config.Email != "" && c.config.Password != "" {
+	if c.AccessToken != "" {
+		c.refreshSession(c.AccessToken)
+		_ = c.saveCache()
+	} else if c.SessionToken != "" {
+	} else if c.Email != "" && c.Password != "" {
 	} else {
-		return &GptError{Code: -1, Message: "Insufficient login details provided!"}
+		return NewGptError(UserNotValid, "insufficient login details provided")
 	}
-	if c.config.AccessToken == "" {
+	if c.AccessToken == "" {
 		return c.login()
 	}
 	return nil
 }
 
-func (c *Chatbot) refreshHeaders(accessToken string) error {
+func (c *Chatbot) refreshSession(accessToken string) {
 	c.session = gorequests.NewSession(c.sessionPath,
 		gorequests.WithHeader("Accept", "text"),
 		gorequests.WithHeader("Authorization", "Bearer "+accessToken),
@@ -133,21 +164,19 @@ func (c *Chatbot) refreshHeaders(accessToken string) error {
 		gorequests.WithHeader("Connection", "close"),
 		gorequests.WithHeader("Accept-Language", "en-US,en;q=0.9"),
 		gorequests.WithHeader("Referer", "https://chat.openai.com/chat"))
-	c.config.AccessToken = accessToken
-	return c.cacheAccessToken()
 }
 
 type tokenJwt struct {
 	Exp int64 `json:"exp"`
 }
 
-func (c *Chatbot) getCachedAccessToken() (string, error) {
+func (c *Chatbot) loadCache() *Config {
 	config, err := c.readCacheConfig()
 	if err != nil {
-		log.Println("read cached token failed", err)
+		log.Println("read cached config failed", err)
 	}
-	//  Parse access_token as JWT
-	if config.AccessToken != "" {
+	//  check token valid
+	if config != nil && config.AccessToken != "" {
 		accessTokenList := strings.Split(config.AccessToken, ".")
 		if len(accessTokenList) > 0 {
 			toPadding := len(accessTokenList[1]) % 4
@@ -156,29 +185,26 @@ func (c *Chatbot) getCachedAccessToken() (string, error) {
 			}
 			data, err := base64.StdEncoding.DecodeString(accessTokenList[1])
 			if err != nil {
-				return "", &GptError{Code: 5, Message: "Invalid access token"}
+				log.Println("invalid cached token")
+				config.AccessToken = ""
+			} else {
+				token := tokenJwt{}
+				err = json.Unmarshal(data, &token)
+				if err != nil {
+					log.Println("invalid access token")
+					config.AccessToken = ""
+				} else if token.Exp < time.Now().Unix() {
+					log.Println("access token expired")
+					config.AccessToken = ""
+				}
 			}
-			token := tokenJwt{}
-			err = json.Unmarshal(data, &token)
-			if err != nil {
-				return "", &GptError{Code: 5, Message: "Invalid access token"}
-			}
-			if token.Exp < time.Now().Unix() {
-				return "", &GptError{Code: 4, Message: "Access token expired"}
-			}
-		} else {
-			return "", &GptError{Code: 5, Message: "Invalid access token"}
 		}
 	}
-	return config.AccessToken, nil
+	return config
 }
 
-func (c *Chatbot) cacheAccessToken() error {
-	return c.writeCache()
-}
-
-func (c *Chatbot) writeCache() error {
-	data, _ := json.Marshal(c.config)
+func (c *Chatbot) saveCache() error {
+	data, _ := json.Marshal(c.Config)
 	return ioutil.WriteFile(c.cachePath, data, 0o666)
 }
 
@@ -195,88 +221,59 @@ func (c *Chatbot) readCacheConfig() (*Config, error) {
 }
 
 func (c *Chatbot) login() error {
-	if (c.config.Email == "" || c.config.Password == "") &&
-		c.config.SessionToken == "" {
-		return &GptError{Code: 6, Message: "Insufficient login details provided!"}
+	if (c.Email == "" || c.Password == "") &&
+		c.SessionToken == "" {
+		return NewGptError(UserNotValid, "insufficient login details provided")
 	}
-	auth := NewAuthenticator(c.config.UserId).
-		WithEmailPassword(c.config.Email, c.config.Password).
-		WithSessionToken(c.config.SessionToken)
-	if c.config.SessionToken != "" {
+	auth := NewAuthenticator(c.UserId).
+		WithEmailPassword(c.Email, c.Password).
+		WithSessionToken(c.SessionToken)
+	if c.SessionToken != "" {
 		err := auth.getAccessToken()
 		if err != nil {
-			return err
+			return NewGptError(TokenInvalid, err.Error())
 		}
 		if auth.accessToken == "" {
-			c.config.SessionToken = ""
+			c.SessionToken = ""
 			return c.login()
 		}
 	} else {
 		err := auth.begin()
 		if err != nil {
-			return err
+			return NewGptError(TokenInvalid, err.Error())
 		}
-		c.config.SessionToken = auth.sessionToken
+		c.SessionToken = auth.sessionToken
 		err = auth.getAccessToken()
 		if err != nil {
-			return err
+			return NewGptError(TokenInvalid, err.Error())
 		}
 	}
-	return c.refreshHeaders(auth.accessToken)
-}
-
-type Content struct {
-	ContentType string   `json:"content_type"`
-	Parts       []string `json:"parts"`
-}
-
-type MessageMeta struct {
-	ModelSlug string `json:"model_slug"`
-}
-type Message struct {
-	Id       string       `json:"id"`
-	Role     string       `json:"role,omitempty"`
-	Content  *Content     `json:"content,omitempty"`
-	MetaData *MessageMeta `json:"meta_data,omitempty"`
-}
-
-type ConversationData struct {
-	Action          string    `json:"action"`
-	Messages        []Message `json:"messages"`
-	ConversationId  string    `json:"conversation_id,omitempty"`
-	ParentMessageId string    `json:"parent_message_id,omitempty"`
-	Model           string    `json:"model"`
-}
-
-type RetMessage struct {
-	Message        string `json:"message"`
-	ConversationId string `json:"conversation_id"`
-	ParentId       string `json:"parent_id"`
-	Model          string `json:"model"`
+	c.refreshSession(auth.accessToken)
+	return c.saveCache()
 }
 
 func (c *Chatbot) ask(ctx context.Context, prompt string, conversationId, parentId string) (*gorequests.Request, error) {
 	if conversationId == "" && parentId != "" {
-		return nil, &GptError{Code: -1, Message: "conversation_id must be set once parent_id is set"}
+		return nil, NewGptError(RequestInvalid, "conversation_id must be set once parent_id is set")
 	}
-	if conversationId != "" && conversationId != c.conversationId {
-		c.parentId = ""
+	if conversationId != "" && conversationId != c.ConversationId {
+		c.ParentId = ""
 	}
 	if conversationId == "" {
-		conversationId = c.conversationId
+		conversationId = c.ConversationId
 	}
 	if parentId == "" {
-		parentId = c.parentId
+		parentId = c.ParentId
 	}
 	if conversationId == "" && parentId == "" {
 		parentId = uuid.NewString()
 	}
 	if conversationId != "" && parentId == "" {
-		if _, ok := c.conversationMapping[conversationId]; !ok {
-			if c.config.LayLoading {
+		if _, ok := c.ConversationMapping[conversationId]; !ok {
+			if c.LayLoading {
 				history, err := c.getMsgHistory(conversationId)
 				if err == nil {
-					c.conversationMapping[conversationId] = history["current_node"]
+					c.ConversationMapping[conversationId] = history["current_node"]
 				}
 			} else {
 				err := c.mapConversations()
@@ -285,8 +282,8 @@ func (c *Chatbot) ask(ctx context.Context, prompt string, conversationId, parent
 				}
 			}
 		}
-		if _, ok := c.conversationMapping[conversationId]; ok {
-			parentId = c.conversationMapping[conversationId].(string)
+		if _, ok := c.ConversationMapping[conversationId]; ok {
+			parentId = c.ConversationMapping[conversationId].(string)
 		} else {
 			conversationId = ""
 			parentId = uuid.NewString()
@@ -300,10 +297,10 @@ func (c *Chatbot) ask(ctx context.Context, prompt string, conversationId, parent
 		ParentMessageId: parentId,
 		Model:           "text-davinci-002-render-sha",
 	}
-	if c.config.Paid {
+	if c.Paid {
 		data.Model = "text-davinci-002-render-paid"
 	}
-	c.conversationQueue = append(c.conversationQueue, conversationInQueue{
+	c.ConversationQueue = append(c.ConversationQueue, conversationInQueue{
 		conversationId: conversationId,
 		parentId:       parentId,
 	})
@@ -320,13 +317,13 @@ func (c *Chatbot) Ask(ctx context.Context, prompt string, conversationId, parent
 	}
 	resp, err := request.Response()
 	if err != nil {
-		return err
+		return NewGptError(ServerError, err.Error())
 	}
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "Internal Server Error" {
-			return &GptError{Code: -1, Message: line}
+			return NewGptError(ServerError, line)
 		}
 		if line == "" {
 			continue
@@ -344,13 +341,13 @@ func (c *Chatbot) Ask(ctx context.Context, prompt string, conversationId, parent
 		}
 		if !c.checkFields(lineData) {
 			if lineData.Detail.Str == "Too many requests in 1 hour. Try again later." {
-				return &GptError{Code: 2, Message: lineData.Detail.Str}
+				return NewGptError(RateLimitError, lineData.Detail.Str)
 			}
 
 			if lineData.Detail.Code == "invalid_api_key" {
-				return &GptError{Code: 3, Message: lineData.Detail.Message}
+				return NewGptError(TokenInvalid, lineData.Detail.Message)
 			}
-			return &GptError{Code: -1, Message: lineData.Detail.Message}
+			return NewGptError(UnknownError, lineData.Detail.Message)
 		}
 		message, model := "", ""
 		if len(lineData.Message.Content.Parts) > 0 {
@@ -370,13 +367,14 @@ func (c *Chatbot) Ask(ctx context.Context, prompt string, conversationId, parent
 			break
 		}
 	}
-	c.conversationMapping[conversationId] = parentId
+	c.ConversationMapping[conversationId] = parentId
 	if parentId != "" {
-		c.parentId = parentId
+		c.ParentId = parentId
 	}
 	if conversationId != "" {
-		c.conversationId = conversationId
+		c.ConversationId = conversationId
 	}
+	_ = c.saveCache()
 	return nil
 }
 
@@ -386,34 +384,6 @@ func (c *Chatbot) AskNoStream(ctx context.Context, prompt string, conversationId
 		ret = message
 		return true
 	})
-}
-
-type LineWithContent struct {
-	Message        Message `json:"message"`
-	Detail         Detail  `json:"detail"`
-	ConversationId string  `json:"conversation_id"`
-}
-type Detail struct {
-	Str     string `json:"str"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-func (d *Detail) UnmarshalJSON(data []byte) error {
-	if len(data) > 1 && data[0] == '{' {
-		a := struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		}{}
-		err := json.Unmarshal(data, &a)
-		d.Code = a.Code
-		d.Message = a.Message
-		return err
-	}
-	if len(data) >= 2 {
-		d.Str = string(data[1 : len(data)-1])
-	}
-	return nil
 }
 
 func (c *Chatbot) checkFields(data *LineWithContent) bool {
@@ -426,14 +396,6 @@ func (c *Chatbot) checkFields(data *LineWithContent) bool {
 	return true
 }
 
-type ConversationResponse struct {
-	Items []Conversation `json:"items"`
-}
-
-type Conversation struct {
-	Id string `json:"id"`
-}
-
 func (c *Chatbot) getConversations(offset, limit int) ([]Conversation, error) {
 	if limit == 0 {
 		limit = 20
@@ -442,21 +404,22 @@ func (c *Chatbot) getConversations(offset, limit int) ([]Conversation, error) {
 	conversations := &ConversationResponse{}
 	request := c.session.New("GET", url)
 	err := request.Unmarshal(conversations)
-	return conversations.Items, err
+	if err != nil {
+		return nil, NewGptError(ServerError, err.Error())
+	}
+	return conversations.Items, nil
 
 }
 
 func checkResponse(request *gorequests.Request) error {
 	statusCode, err := request.ResponseStatus()
 	if err != nil {
-		return err
+		return NewGptError(ServerError, err.Error())
 	} else if statusCode != 200 {
-		return &GptError{Code: statusCode, Message: request.MustText()}
+		return NewGptError(ErrorCode(statusCode), request.MustText())
 	}
 	return nil
 }
-
-type MsgHistory map[string]interface{}
 
 func (c *Chatbot) getMsgHistory(convId string) (MsgHistory, error) {
 	url := BASEURL + "api/conversation/" + convId
@@ -464,7 +427,7 @@ func (c *Chatbot) getMsgHistory(convId string) (MsgHistory, error) {
 	request := c.session.New("GET", url)
 	statusCode := request.MustResponseStatus()
 	if statusCode != 200 {
-		return nil, &GptError{Code: statusCode, Message: request.MustText()}
+		return nil, NewGptError(ErrorCode(statusCode), request.MustText())
 	}
 	err := request.Unmarshal(&history)
 	return history, err
@@ -511,23 +474,23 @@ func (c *Chatbot) mapConversations() error {
 			continue
 		}
 		histories = append(histories, history)
-		c.conversationMapping[a.Id] = history["current_node"]
+		c.ConversationMapping[a.Id] = history["current_node"]
 	}
 	return nil
 }
 
 func (c *Chatbot) resetChat() {
-	c.conversationId = "None"
-	c.parentId = uuid.NewString()
+	c.ConversationId = "None"
+	c.ParentId = uuid.NewString()
 }
 
 func (c *Chatbot) rollbackConversation(num int) {
 	for i := 0; i < num; i++ {
-		if len(c.conversationQueue) == 0 {
+		if len(c.ConversationQueue) == 0 {
 			return
 		}
-		q := c.conversationQueue[len(c.conversationQueue)-1]
-		c.conversationId, c.parentId = q.conversationId, q.parentId
-		c.conversationQueue = c.conversationQueue[0 : len(c.conversationQueue)-1]
+		q := c.ConversationQueue[len(c.ConversationQueue)-1]
+		c.ConversationId, c.ParentId = q.conversationId, q.parentId
+		c.ConversationQueue = c.ConversationQueue[0 : len(c.ConversationQueue)-1]
 	}
 }

@@ -1,6 +1,7 @@
 package chatgpt_go
 
 import (
+	"errors"
 	"fmt"
 	netUrl "net/url"
 	"regexp"
@@ -307,8 +308,11 @@ func (a *Authenticator) getAccessToken() error {
 	statusCode := request.MustResponseStatus()
 	if statusCode == 200 {
 		a.accessToken = resp.AccessToken
-		return nil
 	} else {
 		return fmt.Errorf("code: %d, message: %s", statusCode, request.MustText())
 	}
+	if a.accessToken == "" {
+		return errors.New("failed to get token")
+	}
+	return nil
 }
